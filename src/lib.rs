@@ -153,7 +153,7 @@
 #![deny(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -448,6 +448,29 @@ impl ConanInstall {
         command
     }
 
+    #[must_use]
+    fn get_conan(&self) -> OsString {
+        std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into())
+    }
+
+    #[must_use]
+    fn get_recipe(&self) -> PathBuf {
+        self.recipe_path
+            .as_deref()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    }
+
+    #[must_use]
+    fn get_output_folder(&self) -> PathBuf {
+        match &self.output_folder {
+            Some(s) => s.clone(),
+            None => std::env::var_os("OUT_DIR")
+                .expect("OUT_DIR environment variable must be set")
+                .into(),
+        }
+    }
+
     /// Runs the `conan install` command and captures its JSON-formatted output.
     ///
     /// # Panics
@@ -455,15 +478,8 @@ impl ConanInstall {
     /// Panics if the Conan executable cannot be found.
     #[must_use]
     pub fn run(&self) -> ConanOutput {
-        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
-        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
-
-        let output_folder = match &self.output_folder {
-            Some(s) => s.clone(),
-            None => std::env::var_os("OUT_DIR")
-                .expect("OUT_DIR environment variable must be set")
-                .into(),
-        };
+        let conan = self.get_conan();
+        let (recipe, output_folder) = (self.get_recipe(), self.get_output_folder());
 
         if self.new_profile {
             Self::run_profile_detect(&conan, self.profile.as_deref());
@@ -473,7 +489,7 @@ impl ConanInstall {
             };
         }
 
-        let mut command = self.build_command(&conan, recipe, &output_folder);
+        let mut command = self.build_command(&conan, &recipe, &output_folder);
 
         let output = command
             .output()
@@ -505,7 +521,7 @@ impl ConanInstall {
     pub fn run_with_streaming(&self) -> ConanOutput {
         let stdout_callback = |line: &str| println!("{}", line);
         let stderr_callback = |line: &str| eprintln!("{}", line);
-        
+
         self.run_with_output(stdout_callback, stderr_callback)
     }
 
@@ -543,15 +559,8 @@ impl ConanInstall {
         F: Fn(&str) + Send + 'static,
         G: Fn(&str) + Send + 'static,
     {
-        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
-        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
-
-        let output_folder = match &self.output_folder {
-            Some(s) => s.clone(),
-            None => std::env::var_os("OUT_DIR")
-                .expect("OUT_DIR environment variable must be set")
-                .into(),
-        };
+        let conan = self.get_conan();
+        let (recipe, output_folder) = (self.get_recipe(), self.get_output_folder());
 
         if self.new_profile {
             Self::run_profile_detect(&conan, self.profile.as_deref());
@@ -561,7 +570,7 @@ impl ConanInstall {
             };
         }
 
-        let mut command = self.build_command(&conan, recipe, &output_folder);
+        let mut command = self.build_command(&conan, &recipe, &output_folder);
 
         // Set up pipes for stdout and stderr
         command.stdout(Stdio::piped());
