@@ -591,21 +591,17 @@ impl ConanInstall {
         // Spawn threads to read stdout and stderr
         let stdout_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    stdout_callback(&line);
-                    stdout_tx.send(line).unwrap();
-                }
+            for line in reader.lines().map_while(Result::ok) {
+                stdout_callback(&line);
+                stdout_tx.send(line).unwrap();
             }
         });
 
         let stderr_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    stderr_callback(&line);
-                    stderr_tx.send(line).unwrap();
-                }
+            for line in reader.lines().map_while(Result::ok) {
+                stderr_callback(&line);
+                stderr_tx.send(line).unwrap();
             }
         });
 

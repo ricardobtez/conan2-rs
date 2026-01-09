@@ -44,7 +44,7 @@ fn test_streaming_output() {
     // The final output should still be parseable
     let cargo = output.parse();
     let includes = cargo.include_paths();
-    assert!(includes.len() > 0);
+    assert!(includes.is_empty());
 }
 
 #[test]
@@ -62,5 +62,5 @@ fn test_simple_streaming() {
     // The output should still be parseable
     let cargo = output.parse();
     let includes = cargo.include_paths();
-    assert!(includes.len() > 0);
+    assert!(includes.is_empty());
 }
