@@ -398,31 +398,11 @@ impl ConanInstall {
         self
     }
 
-    /// Runs the `conan install` command and captures its JSON-formatted output.
+    /// Builds the Conan command with all configured options.
     ///
-    /// # Panics
-    ///
-    /// Panics if the Conan executable cannot be found.
-    #[must_use]
-    pub fn run(&self) -> ConanOutput {
-        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
-        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
-
-        let output_folder = match &self.output_folder {
-            Some(s) => s.clone(),
-            None => std::env::var_os("OUT_DIR")
-                .expect("OUT_DIR environment variable must be set")
-                .into(),
-        };
-
-        if self.new_profile {
-            Self::run_profile_detect(&conan, self.profile.as_deref());
-
-            if self.build_profile != self.profile {
-                Self::run_profile_detect(&conan, self.build_profile.as_deref());
-            };
-        }
-
+    /// This helper function constructs the `conan install` command with all
+    /// the configured options, profiles, settings, etc.
+    fn build_command(&self, conan: &OsStr, recipe: &Path, output_folder: &Path) -> Command {
         let mut command = Command::new(conan);
         command
             .arg("install")
@@ -464,6 +444,36 @@ impl ConanInstall {
             command.arg("--conf");
             command.arg(format!("{key}={value}"));
         }
+
+        command
+    }
+
+    /// Runs the `conan install` command and captures its JSON-formatted output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    #[must_use]
+    pub fn run(&self) -> ConanOutput {
+        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
+        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
+
+        let output_folder = match &self.output_folder {
+            Some(s) => s.clone(),
+            None => std::env::var_os("OUT_DIR")
+                .expect("OUT_DIR environment variable must be set")
+                .into(),
+        };
+
+        if self.new_profile {
+            Self::run_profile_detect(&conan, self.profile.as_deref());
+
+            if self.build_profile != self.profile {
+                Self::run_profile_detect(&conan, self.build_profile.as_deref());
+            };
+        }
+
+        let mut command = self.build_command(&conan, recipe, &output_folder);
 
         let output = command
             .output()
@@ -551,47 +561,7 @@ impl ConanInstall {
             };
         }
 
-        let mut command = Command::new(conan);
-        command
-            .arg("install")
-            .arg(recipe)
-            .arg(format!("-v{}", self.verbosity))
-            .arg("--format")
-            .arg("json")
-            .arg("--output-folder")
-            .arg(output_folder);
-
-        if let Some(profile) = self.profile.as_deref() {
-            command.arg("--profile:host").arg(profile);
-        }
-
-        if let Some(build_profile) = self.build_profile.as_deref() {
-            command.arg("--profile:build").arg(build_profile);
-        }
-
-        if let Some(build) = self.build.as_deref() {
-            command.arg("--build");
-            command.arg(build);
-        }
-
-        if let Some(build_type) = self.build_type.as_deref() {
-            // Prefer the user-provided build setting values.
-            command.arg("--settings");
-            command.arg(format!("build_type={build_type}"));
-        } else {
-            // Otherwise, use additional environment variables set by Cargo.
-            Self::add_settings_from_env(&mut command);
-        }
-
-        for (scope, key, value) in &self.options {
-            command.arg("--options");
-            command.arg(format!("{scope}:{key}={value}"));
-        }
-
-        for (key, value) in &self.confs {
-            command.arg("--conf");
-            command.arg(format!("{key}={value}"));
-        }
+        let mut command = self.build_command(&conan, recipe, &output_folder);
 
         // Set up pipes for stdout and stderr
         command.stdout(Stdio::piped());
