@@ -38,6 +38,35 @@
 //! ConanInstall::new().run().parse().emit();
 //! ```
 //!
+//! ## Monitoring progress with real-time output
+//!
+//! To see the Conan command output in real-time while it's running (instead of waiting
+//! until completion), use the streaming methods:
+//!
+//! ```no_run
+//! use conan2::ConanInstall;
+//!
+//! // Simple streaming to stdout/stderr
+//! ConanInstall::new()
+//!     .run_with_streaming()
+//!     .parse()
+//!     .emit();
+//! ```
+//!
+//! Or with custom output handlers:
+//!
+//! ```no_run
+//! use conan2::ConanInstall;
+//!
+//! let stdout_callback = |line: &str| println!("CONAN: {}", line);
+//! let stderr_callback = |line: &str| eprintln!("CONAN-ERROR: {}", line);
+//!
+//! ConanInstall::new()
+//!     .run_with_output(stdout_callback, stderr_callback)
+//!     .parse()
+//!     .emit();
+//! ```
+//!
 //! The most commonly used `build_type` Conan setting will be defined automatically
 //! depending on the current Cargo build profile: `debug` or `release`.
 //!
@@ -124,10 +153,12 @@
 #![deny(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use serde_json::{Map, Value};
 
@@ -367,31 +398,11 @@ impl ConanInstall {
         self
     }
 
-    /// Runs the `conan install` command and captures its JSON-formatted output.
+    /// Builds the Conan command with all configured options.
     ///
-    /// # Panics
-    ///
-    /// Panics if the Conan executable cannot be found.
-    #[must_use]
-    pub fn run(&self) -> ConanOutput {
-        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
-        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
-
-        let output_folder = match &self.output_folder {
-            Some(s) => s.clone(),
-            None => std::env::var_os("OUT_DIR")
-                .expect("OUT_DIR environment variable must be set")
-                .into(),
-        };
-
-        if self.new_profile {
-            Self::run_profile_detect(&conan, self.profile.as_deref());
-
-            if self.build_profile != self.profile {
-                Self::run_profile_detect(&conan, self.build_profile.as_deref());
-            };
-        }
-
+    /// This helper function constructs the `conan install` command with all
+    /// the configured options, profiles, settings, etc.
+    fn build_command(&self, conan: &OsStr, recipe: &Path, output_folder: &Path) -> Command {
         let mut command = Command::new(conan);
         command
             .arg("install")
@@ -434,9 +445,194 @@ impl ConanInstall {
             command.arg(format!("{key}={value}"));
         }
 
+        command
+    }
+
+    #[must_use]
+    fn get_conan(&self) -> OsString {
+        std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into())
+    }
+
+    #[must_use]
+    fn get_recipe(&self) -> PathBuf {
+        self.recipe_path
+            .as_deref()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    }
+
+    #[must_use]
+    fn get_output_folder(&self) -> PathBuf {
+        match &self.output_folder {
+            Some(s) => s.clone(),
+            None => std::env::var_os("OUT_DIR")
+                .expect("OUT_DIR environment variable must be set")
+                .into(),
+        }
+    }
+
+    /// Runs the `conan install` command and captures its JSON-formatted output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    #[must_use]
+    pub fn run(&self) -> ConanOutput {
+        let conan = self.get_conan();
+        let (recipe, output_folder) = (self.get_recipe(), self.get_output_folder());
+
+        if self.new_profile {
+            Self::run_profile_detect(&conan, self.profile.as_deref());
+
+            if self.build_profile != self.profile {
+                Self::run_profile_detect(&conan, self.build_profile.as_deref());
+            };
+        }
+
+        let mut command = self.build_command(&conan, &recipe, &output_folder);
+
         let output = command
             .output()
             .expect("failed to run the Conan executable");
+
+        ConanOutput(output)
+    }
+
+    /// Runs the `conan install` command with real-time output streaming to stdout/stderr.
+    ///
+    /// This is a convenience method that prints the command output to stdout and stderr
+    /// as it happens, allowing users to monitor progress in real-time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::ConanInstall;
+    ///
+    /// let output = ConanInstall::new()
+    ///     .run_with_streaming()
+    ///     .parse()
+    ///     .emit();
+    /// ```
+    #[must_use]
+    pub fn run_with_streaming(&self) -> ConanOutput {
+        let stdout_callback = |line: &str| println!("{}", line);
+        let stderr_callback = |line: &str| eprintln!("{}", line);
+
+        self.run_with_output(stdout_callback, stderr_callback)
+    }
+
+    /// Runs the `conan install` command with real-time output streaming.
+    ///
+    /// This method allows monitoring the command's progress by providing callbacks
+    /// for stdout and stderr output. The JSON output is still captured and returned
+    /// for parsing.
+    ///
+    /// # Arguments
+    ///
+    /// * `stdout_callback` - A function that receives stdout lines as they are produced
+    /// * `stderr_callback` - A function that receives stderr lines as they are produced
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::ConanInstall;
+    ///
+    /// let stdout_callback = |line: &str| println!("STDOUT: {}", line);
+    /// let stderr_callback = |line: &str| eprintln!("STDERR: {}", line);
+    ///
+    /// let output = ConanInstall::new()
+    ///     .run_with_output(stdout_callback, stderr_callback)
+    ///     .parse()
+    ///     .emit();
+    /// ```
+    #[must_use]
+    pub fn run_with_output<F, G>(&self, stdout_callback: F, stderr_callback: G) -> ConanOutput
+    where
+        F: Fn(&str) + Send + 'static,
+        G: Fn(&str) + Send + 'static,
+    {
+        let conan = self.get_conan();
+        let (recipe, output_folder) = (self.get_recipe(), self.get_output_folder());
+
+        if self.new_profile {
+            Self::run_profile_detect(&conan, self.profile.as_deref());
+
+            if self.build_profile != self.profile {
+                Self::run_profile_detect(&conan, self.build_profile.as_deref());
+            };
+        }
+
+        let mut command = self.build_command(&conan, &recipe, &output_folder);
+
+        // Set up pipes for stdout and stderr
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .expect("failed to spawn the Conan executable");
+
+        // Capture stdout and stderr separately
+        let stdout = child.stdout.take().expect("failed to capture stdout");
+        let stderr = child.stderr.take().expect("failed to capture stderr");
+
+        // Create channels to collect the output
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+
+        // Spawn threads to read stdout and stderr
+        let stdout_handle = thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                stdout_callback(&line);
+                stdout_tx.send(line).unwrap();
+            }
+        });
+
+        let stderr_handle = thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                stderr_callback(&line);
+                stderr_tx.send(line).unwrap();
+            }
+        });
+
+        // Wait for the child process to finish
+        let status = child.wait().expect("failed to wait for Conan process");
+
+        // Join the threads to ensure all output is processed
+        stdout_handle.join().unwrap();
+        stderr_handle.join().unwrap();
+
+        // Collect all the output lines
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+
+        while let Ok(line) = stdout_rx.try_recv() {
+            stdout_lines.push(line);
+        }
+
+        while let Ok(line) = stderr_rx.try_recv() {
+            stderr_lines.push(line);
+        }
+
+        // Reconstruct the output
+        let stdout_bytes = stdout_lines.join("\n").into_bytes();
+        let stderr_bytes = stderr_lines.join("\n").into_bytes();
+
+        let output = Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        };
 
         ConanOutput(output)
     }
