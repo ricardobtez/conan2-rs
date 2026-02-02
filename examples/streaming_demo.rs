@@ -5,41 +5,69 @@ fn main() {
 
     // Example 1: Simple streaming to stdout/stderr
     println!("\n1. Simple streaming to stdout/stderr:");
+    println!("   use std::sync::mpsc;");
+    println!("");
+    println!("   let (tx, rx) = mpsc::channel::<String>();");
+    println!("   std::thread::spawn(move || {{");
+    println!("       while let Ok(line) = rx.recv() {{");
+    println!("           if line.starts_with(\"STDOUT: \") {{");
+    println!(r#"               println!("{{}}", &line[8..]);"#);
+    println!("           }} else if line.starts_with(\"STDERR: \") {{");
+    println!(r#"               eprintln!("{{}}", &line[8..]);"#);
+    println!("           }}");
+    println!("       }}");
+    println!("   }});");
+    println!("");
     println!("   ConanInstall::new()");
-    println!("       .run_with_streaming()");
+    println!("       .run_with_output(tx)");
     println!("       .parse()");
     println!("       .emit();");
     println!("");
 
     // Example 2: Custom output handlers
     println!("2. Custom output handlers:");
-    println!("   let stdout_callback = |line: &str| println!(\"CONAN: {{}}\", line);");
-    println!("   let stderr_callback = |line: &str| eprintln!(\"CONAN-ERROR: {{}}\", line);");
+    println!("   use std::sync::mpsc;");
+    println!("");
+    println!("   let (tx, rx) = mpsc::channel();");
+    println!("   std::thread::spawn(move || {{");
+    println!("       while let Ok(line) = rx.recv() {{");
+    println!("           if line.starts_with(\"STDOUT: \") {{");
+    println!(r#"               println!("CONAN: {{}}", &line[8..]);"#);
+    println!("           }} else if line.starts_with(\"STDERR: \") {{");
+    println!(r#"               eprintln!("CONAN-ERROR: {{}}", &line[8..]);"#);
+    println!("           }}");
+    println!("       }}");
+    println!("   }});");
     println!("");
     println!("   ConanInstall::new()");
-    println!("       .run_with_output(stdout_callback, stderr_callback)");
+    println!("       .run_with_output(tx)");
     println!("       .parse()");
     println!("       .emit();");
     println!("");
 
     // Example 3: Advanced usage with progress monitoring
     println!("3. Advanced usage with progress monitoring:");
-    println!("   use std::sync::{{Arc, Mutex}};");
+    println!("   use std::sync::{{Arc, Mutex, mpsc}};");
     println!("");
     println!("   let progress = Arc::new(Mutex::new(0));");
-    println!("   let stdout_callback = {{");
-    println!("       let progress = progress.clone();");
-    println!("       move |line: &str| {{");
-    println!("           if line.contains(\"Installing\") || line.contains(\"Downloading\") {{");
+    println!("   let (tx, rx) = mpsc::channel();");
+    println!("   std::thread::spawn(move || {{");
+    println!("       while let Ok(line) = rx.recv() {{");
+    println!("           if line.starts_with(\"STDOUT: \") {{");
+    println!("               let content = &line[8..];");
+    println!("               if content.contains(\"Installing\") || content.contains(\"Downloading\") {{");
     println!(
-        "               println!(\"Progress: {{}} - {{}}\", line, *progress.lock().unwrap());"
+        "                   println!(\"Progress: {{}} - {{}}\", content, *progress.lock().unwrap());"
     );
+    println!("               }}");
+    println!("           }} else if line.starts_with(\"STDERR: \") {{");
+    println!(r#"               eprintln!("Error: {{}}", &line[8..]);"#);
     println!("           }}");
     println!("       }}");
-    println!("   }};");
+    println!("   }});");
     println!("");
     println!("   ConanInstall::new()");
-    println!("       .run_with_output(stdout_callback, |line| eprintln!(\"Error: {{}}\", line))");
+    println!("       .run_with_output(tx)");
     println!("       .parse()");
     println!("       .emit();");
 

@@ -41,28 +41,52 @@
 //! ## Monitoring progress with real-time output
 //!
 //! To see the Conan command output in real-time while it's running (instead of waiting
-//! until completion), use the streaming methods:
+//! until completion), use the `run_with_output` method with mpsc channels:
 //!
 //! ```no_run
 //! use conan2::ConanInstall;
+//! use std::sync::mpsc;
 //!
-//! // Simple streaming to stdout/stderr
+//! let (tx, rx) = mpsc::channel::<String>();
+//!
+//! // Spawn a thread to handle the output
+//! std::thread::spawn(move || {
+//!     while let Ok(line) = rx.recv() {
+//!         if line.starts_with("STDOUT: ") {
+//!             println!("{}", &line[8..]);
+//!         } else if line.starts_with("STDERR: ") {
+//!             eprintln!("{}", &line[8..]);
+//!         }
+//!     }
+//! });
+//!
 //! ConanInstall::new()
-//!     .run_with_streaming()
+//!     .run_with_output(tx)
 //!     .parse()
 //!     .emit();
 //! ```
 //!
-//! Or with custom output handlers:
+//! You can also customize the output handling:
 //!
 //! ```no_run
-//! use conan2::ConanInstall;
+//! use conan2::{ConanInstall};
+//! use std::sync::mpsc;
 //!
-//! let stdout_callback = |line: &str| println!("CONAN: {}", line);
-//! let stderr_callback = |line: &str| eprintln!("CONAN-ERROR: {}", line);
+//! let (tx, rx) = mpsc::channel::<String>();
+//!
+//! // Spawn a thread to handle the output with custom formatting
+//! std::thread::spawn(move || {
+//!     while let Ok(line) = rx.recv() {
+//!         if line.starts_with("STDOUT: ") {
+//!             println!("CONAN: {}", &line[8..]);
+//!         } else if line.starts_with("STDERR: ") {
+//!             eprintln!("CONAN-ERROR: {}", &line[8..]);
+//!         }
+//!     }
+//! });
 //!
 //! ConanInstall::new()
-//!     .run_with_output(stdout_callback, stderr_callback)
+//!     .run_with_output(tx)
 //!     .parse()
 //!     .emit();
 //! ```
@@ -157,7 +181,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use serde_json::{Map, Value};
@@ -498,43 +522,16 @@ impl ConanInstall {
         ConanOutput(output)
     }
 
-    /// Runs the `conan install` command with real-time output streaming to stdout/stderr.
-    ///
-    /// This is a convenience method that prints the command output to stdout and stderr
-    /// as it happens, allowing users to monitor progress in real-time.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the Conan executable cannot be found.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use conan2::ConanInstall;
-    ///
-    /// let output = ConanInstall::new()
-    ///     .run_with_streaming()
-    ///     .parse()
-    ///     .emit();
-    /// ```
-    #[must_use]
-    pub fn run_with_streaming(&self) -> ConanOutput {
-        let stdout_callback = |line: &str| println!("{}", line);
-        let stderr_callback = |line: &str| eprintln!("{}", line);
-
-        self.run_with_output(stdout_callback, stderr_callback)
-    }
-
     /// Runs the `conan install` command with real-time output streaming.
     ///
-    /// This method allows monitoring the command's progress by providing callbacks
-    /// for stdout and stderr output. The JSON output is still captured and returned
+    /// This method allows monitoring the command's progress by providing an mpsc channel
+    /// that receives both stdout and stderr output. The JSON output is still captured and returned
     /// for parsing.
     ///
     /// # Arguments
     ///
-    /// * `stdout_callback` - A function that receives stdout lines as they are produced
-    /// * `stderr_callback` - A function that receives stderr lines as they are produced
+    /// * `output_tx` - An mpsc sender that receives output lines as they are produced.
+    ///   Each line is prefixed with "STDOUT: " or "STDERR: " to indicate its source.
     ///
     /// # Panics
     ///
@@ -544,21 +541,28 @@ impl ConanInstall {
     ///
     /// ```no_run
     /// use conan2::ConanInstall;
+    /// use std::sync::mpsc;
     ///
-    /// let stdout_callback = |line: &str| println!("STDOUT: {}", line);
-    /// let stderr_callback = |line: &str| eprintln!("STDERR: {}", line);
+    /// let (tx, rx) = mpsc::channel::<String>();
     ///
     /// let output = ConanInstall::new()
-    ///     .run_with_output(stdout_callback, stderr_callback)
+    ///     .run_with_output(tx)
     ///     .parse()
     ///     .emit();
+    ///
+    /// // Process received output in another thread
+    /// std::thread::spawn(move || {
+    ///     while let Ok(line) = rx.recv() {
+    ///         if line.starts_with("STDOUT: ") {
+    ///             println!("{}", &line[8..]);
+    ///         } else if line.starts_with("STDERR: ") {
+    ///             eprintln!("{}", &line[8..]);
+    ///         }
+    ///     }
+    /// });
     /// ```
     #[must_use]
-    pub fn run_with_output<F, G>(&self, stdout_callback: F, stderr_callback: G) -> ConanOutput
-    where
-        F: Fn(&str) + Send + 'static,
-        G: Fn(&str) + Send + 'static,
-    {
+    pub fn run_with_output(&self, output_tx: mpsc::Sender<String>) -> ConanOutput {
         let conan = self.get_conan();
         let (recipe, output_folder) = (self.get_recipe(), self.get_output_folder());
 
@@ -584,24 +588,32 @@ impl ConanInstall {
         let stdout = child.stdout.take().expect("failed to capture stdout");
         let stderr = child.stderr.take().expect("failed to capture stderr");
 
-        // Create channels to collect the output
-        let (stdout_tx, stdout_rx) = mpsc::channel();
-        let (stderr_tx, stderr_rx) = mpsc::channel();
+        // Use Arc<Mutex<Vec<String>>> to collect output from both threads
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+
+        // Clone the sender and collectors for both threads
+        let stdout_tx = output_tx.clone();
+        let stderr_tx = output_tx.clone();
+        let stdout_lines_clone = stdout_lines.clone();
+        let stderr_lines_clone = stderr_lines.clone();
 
         // Spawn threads to read stdout and stderr
         let stdout_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                stdout_callback(&line);
-                stdout_tx.send(line).unwrap();
+                let formatted_line = format!("STDOUT: {}", line);
+                stdout_tx.send(formatted_line.clone()).unwrap();
+                stdout_lines_clone.lock().unwrap().push(line);
             }
         });
 
         let stderr_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                stderr_callback(&line);
-                stderr_tx.send(line).unwrap();
+                let formatted_line = format!("STDERR: {}", line);
+                stderr_tx.send(formatted_line).unwrap();
+                stderr_lines_clone.lock().unwrap().push(line);
             }
         });
 
@@ -612,17 +624,9 @@ impl ConanInstall {
         stdout_handle.join().unwrap();
         stderr_handle.join().unwrap();
 
-        // Collect all the output lines
-        let mut stdout_lines = Vec::new();
-        let mut stderr_lines = Vec::new();
-
-        while let Ok(line) = stdout_rx.try_recv() {
-            stdout_lines.push(line);
-        }
-
-        while let Ok(line) = stderr_rx.try_recv() {
-            stderr_lines.push(line);
-        }
+        // Extract the collected lines
+        let stdout_lines = Arc::try_unwrap(stdout_lines).unwrap().into_inner().unwrap();
+        let stderr_lines = Arc::try_unwrap(stderr_lines).unwrap().into_inner().unwrap();
 
         // Reconstruct the output
         let stdout_bytes = stdout_lines.join("\n").into_bytes();
