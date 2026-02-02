@@ -181,7 +181,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 
 use serde_json::{Map, Value};
@@ -588,33 +588,46 @@ impl ConanInstall {
         let stdout = child.stdout.take().expect("failed to capture stdout");
         let stderr = child.stderr.take().expect("failed to capture stderr");
 
-        // Use Arc<Mutex<Vec<String>>> to collect output from both threads
-        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        // Use channels to collect output from both streams without locking overhead
+        let (stdout_collector_tx, stdout_collector_rx) = mpsc::channel::<Vec<u8>>();
+        let (stderr_collector_tx, stderr_collector_rx) = mpsc::channel::<Vec<u8>>();
 
-        // Clone the sender and collectors for both threads
+        // Clone the sender for both streams
         let stdout_tx = output_tx.clone();
         let stderr_tx = output_tx.clone();
-        let stdout_lines_clone = stdout_lines.clone();
-        let stderr_lines_clone = stderr_lines.clone();
 
-        // Spawn threads to read stdout and stderr
+        // Spawn a single thread to read stdout
         let stdout_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
+            let mut stdout_lines = Vec::new();
+
             for line in reader.lines().map_while(Result::ok) {
                 let formatted_line = format!("STDOUT: {}", line);
-                stdout_tx.send(formatted_line.clone()).unwrap();
-                stdout_lines_clone.lock().unwrap().push(line);
+                stdout_tx.send(formatted_line).unwrap();
+                stdout_lines.push(line);
             }
+
+            // Send the collected stdout data
+            stdout_collector_tx
+                .send(stdout_lines.join("\n").into_bytes())
+                .unwrap();
         });
 
+        // Spawn a single thread to read stderr
         let stderr_handle = thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
+            let mut stderr_lines = Vec::new();
+
             for line in reader.lines().map_while(Result::ok) {
                 let formatted_line = format!("STDERR: {}", line);
                 stderr_tx.send(formatted_line).unwrap();
-                stderr_lines_clone.lock().unwrap().push(line);
+                stderr_lines.push(line);
             }
+
+            // Send the collected stderr data
+            stderr_collector_tx
+                .send(stderr_lines.join("\n").into_bytes())
+                .unwrap();
         });
 
         // Wait for the child process to finish
@@ -624,13 +637,9 @@ impl ConanInstall {
         stdout_handle.join().unwrap();
         stderr_handle.join().unwrap();
 
-        // Extract the collected lines
-        let stdout_lines = Arc::try_unwrap(stdout_lines).unwrap().into_inner().unwrap();
-        let stderr_lines = Arc::try_unwrap(stderr_lines).unwrap().into_inner().unwrap();
-
-        // Reconstruct the output
-        let stdout_bytes = stdout_lines.join("\n").into_bytes();
-        let stderr_bytes = stderr_lines.join("\n").into_bytes();
+        // Receive the collected data
+        let stdout_bytes = stdout_collector_rx.recv().unwrap();
+        let stderr_bytes = stderr_collector_rx.recv().unwrap();
 
         let output = Output {
             status,
