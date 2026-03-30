@@ -671,7 +671,9 @@ impl ConanInstall {
             });
 
             // Wait for child to complete
-            let output = child.wait_with_output().expect("failed to wait for child process");
+            let output = child
+                .wait_with_output()
+                .expect("failed to wait for child process");
 
             // Wait for forwarding threads to finish
             let _ = stdout_handle.join();
