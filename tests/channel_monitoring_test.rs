@@ -33,7 +33,7 @@ fn test_channel_monitoring_api() {
     // 1. Spawn a thread to read from stdout_rx and stderr_rx
     // 2. Process the real-time output
     // 3. Call monitor.wait() to get the final ConanOutput
-    
+
     // This test just verifies the API compiles and the types work correctly
 }
 
