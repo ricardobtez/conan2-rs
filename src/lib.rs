@@ -148,14 +148,43 @@
 //! let output = progress.wait();
 //! output.parse().emit();
 //! ```
+//!
+//! ### Channel-based monitoring
+//!
+//! For more flexible monitoring, use channels to receive real-time output:
+//!
+//! ```no_run
+//! use conan2::ConanInstall;
+//! use std::sync::mpsc;
+//! use std::thread;
+//!
+//! let (stdout_tx, stdout_rx) = mpsc::channel();
+//! let (stderr_tx, stderr_rx) = mpsc::channel();
+//!
+//! let monitor = ConanInstall::new()
+//!     .run_with_channels(stdout_tx, stderr_tx);
+//!
+//! // Monitor stdout in a separate thread
+//! thread::spawn(move || {
+//!     while let Ok(data) = stdout_rx.recv() {
+//!         println!("Output: {}", String::from_utf8_lossy(&data));
+//!     }
+//! });
+//!
+//! // Wait for completion and get final output
+//! let output = monitor.wait();
+//! output.parse().emit();
+//! ```
 
 #![deny(missing_docs)]
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, ChildStderr, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use serde_json::{Map, Value};
 
@@ -252,6 +281,11 @@ pub struct ConanProgress {
     child: Child,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
+}
+
+/// Channel-based progress monitor that sends output chunks to caller-provided channels
+pub struct ConanChannelMonitor {
+    join_handle: thread::JoinHandle<ConanOutput>,
 }
 
 /// Build script instructions for Cargo
@@ -604,6 +638,181 @@ impl ConanInstall {
         }
     }
 
+    /// Runs the `conan install` command with channel-based monitoring.
+    ///
+    /// This method spawns the command in a separate thread and sends real-time
+    /// stdout and stderr chunks to the provided channels. The caller can monitor
+    /// progress by receiving from these channels while the command executes.
+    ///
+    /// # Arguments
+    ///
+    /// * `stdout_tx` - Sender for stdout chunks (bytes)
+    /// * `stderr_tx` - Sender for stderr chunks (bytes)
+    ///
+    /// # Returns
+    ///
+    /// A `ConanChannelMonitor` that can be used to wait for the final output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::ConanInstall;
+    /// use std::sync::mpsc;
+    /// use std::thread;
+    ///
+    /// let (stdout_tx, stdout_rx) = mpsc::channel();
+    /// let (stderr_tx, stderr_rx) = mpsc::channel();
+    ///
+    /// let monitor = ConanInstall::new()
+    ///     .run_with_channels(stdout_tx, stderr_tx);
+    ///
+    /// // Monitor progress in real-time
+    /// thread::spawn(move || {
+    ///     while let Ok(data) = stdout_rx.recv() {
+    ///         println!("Stdout: {}", String::from_utf8_lossy(&data));
+    ///     }
+    /// });
+    ///
+    /// // Wait for final output
+    /// let output = monitor.wait();
+    /// output.parse().emit();
+    /// ```
+    pub fn run_with_channels(
+        &self,
+        stdout_tx: mpsc::Sender<Vec<u8>>,
+        stderr_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ConanChannelMonitor {
+        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
+        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
+
+        let output_folder = match &self.output_folder {
+            Some(s) => s.clone(),
+            None => std::env::var_os("OUT_DIR")
+                .expect("OUT_DIR environment variable must be set")
+                .into(),
+        };
+
+        if self.new_profile {
+            Self::run_profile_detect(&conan, self.profile.as_deref());
+
+            if self.build_profile != self.profile {
+                Self::run_profile_detect(&conan, self.build_profile.as_deref());
+            };
+        }
+
+        let mut command = Command::new(conan);
+        command
+            .arg("install")
+            .arg(recipe)
+            .arg(format!("-v{}", self.verbosity))
+            .arg("--format")
+            .arg("json")
+            .arg("--output-folder")
+            .arg(output_folder)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(remote) = self.remote.as_deref() {
+            command.arg("--remote");
+            command.arg(remote);
+        }
+
+        if let Some(profile) = self.profile.as_deref() {
+            command.arg("--profile:host").arg(profile);
+        }
+
+        if let Some(build_profile) = self.build_profile.as_deref() {
+            command.arg("--profile:build").arg(build_profile);
+        }
+
+        if let Some(build) = self.build.as_deref() {
+            command.arg("--build");
+            command.arg(build);
+        }
+
+        if let Some(build_type) = self.build_type.as_deref() {
+            command.arg("--settings");
+            command.arg(format!("build_type={build_type}"));
+        } else {
+            Self::add_settings_from_env(&mut command);
+        }
+
+        for (scope, key, value) in &self.options {
+            command.arg("--options");
+            command.arg(format!("{scope}:{key}={value}"));
+        }
+
+        for (key, value) in &self.confs {
+            command.arg("--conf");
+            command.arg(format!("{key}={value}"));
+        }
+
+        self.extra_args.iter().for_each(|x| {
+            command.arg(x);
+        });
+
+        let join_handle = thread::spawn(move || {
+            let mut child = command
+                .spawn()
+                .expect("failed to spawn the Conan executable");
+
+            let mut stdout = child.stdout.take().expect("failed to take stdout");
+            let mut stderr = child.stderr.take().expect("failed to take stderr");
+
+            // Read and forward stdout
+            let stdout_tx_clone = stdout_tx.clone();
+            let stdout_handle = thread::spawn(move || {
+                let mut buffer = [0; 1024];
+                loop {
+                    match stdout.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let data = buffer[..n].to_vec();
+                            if stdout_tx_clone.send(data).is_err() {
+                                // Receiver dropped, stop sending
+                                break;
+                            }
+                        }
+                        Err(_) => break, // Error reading
+                    }
+                }
+            });
+
+            // Read and forward stderr
+            let stderr_handle = thread::spawn(move || {
+                let mut buffer = [0; 1024];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let data = buffer[..n].to_vec();
+                            if stderr_tx.send(data).is_err() {
+                                // Receiver dropped, stop sending
+                                break;
+                            }
+                        }
+                        Err(_) => break, // Error reading
+                    }
+                }
+            });
+
+            // Wait for child to complete
+            let output = child.wait_with_output().expect("failed to wait for child process");
+
+            // Wait for forwarding threads to finish
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+
+            ConanOutput(output)
+        });
+
+        ConanChannelMonitor { join_handle }
+    }
+
     /// Creates a new profile with `conan profile detect` if required.
     fn run_profile_detect(conan: &OsStr, profile: Option<&str>) {
         let mut command = Command::new(conan);
@@ -689,6 +898,18 @@ impl ConanProgress {
             }
             _ => None, // Still running or error
         }
+    }
+}
+
+impl ConanChannelMonitor {
+    /// Waits for the command to complete and returns the final output.
+    ///
+    /// This blocks until the command finishes execution and all output
+    /// has been sent through the channels.
+    pub fn wait(self) -> ConanOutput {
+        self.join_handle
+            .join()
+            .expect("failed to join monitoring thread")
     }
 }
 
