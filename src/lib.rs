@@ -567,9 +567,7 @@ impl ConanInstall {
         stderr_tx: mpsc::Sender<Vec<u8>>,
     ) -> ConanChannelMonitor {
         let mut command = self.build_command();
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let join_handle = thread::spawn(move || {
             let mut child = command
