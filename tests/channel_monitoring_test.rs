@@ -21,6 +21,7 @@ fn test_channel_monitoring_api() {
     // Verify that we can receive from the channels
     // (We won't actually run conan to avoid requiring a real setup)
     // Just verify the API works
+    monitor.wait();
 
     // The monitor should be able to wait (though it will hang without actual conan)
     // For this test, we just verify compilation and basic functionality
@@ -63,6 +64,7 @@ fn test_channel_monitoring_with_timeout() {
 
     // Give threads a chance to start
     thread::sleep(Duration::from_millis(50));
+    monitor.wait();
 
     // Clean up
     drop(stdout_handle);
