@@ -126,32 +126,7 @@
 //!
 //! ### Monitoring command progress
 //!
-//! Monitoring the progress of a `conan install` command in real-time:
-//!
-//! ```no_run
-//! use conan2::ConanInstall;
-//! use std::io::BufRead;
-//!
-//! let install = ConanInstall::new();
-//! let mut progress = install.run_with_progress();
-//!
-//! // Read stdout in real-time
-//! let mut stdout_reader = progress.stdout_reader();
-//! let mut line = String::new();
-//! while progress.is_running() {
-//!     stdout_reader.read_line(&mut line).unwrap();
-//!     println!("Progress: {}", line);
-//!     line.clear();
-//! }
-//!
-//! // Wait for completion and get final output
-//! let output = progress.wait();
-//! output.parse().emit();
-//! ```
-//!
-//! ### Channel-based monitoring
-//!
-//! For more flexible monitoring, use channels to receive real-time output:
+//! Monitor the progress of a `conan install` command in real-time using channels:
 //!
 //! ```no_run
 //! use conan2::ConanInstall;
@@ -180,9 +155,9 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, ChildStderr, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -272,16 +247,6 @@ pub struct ConanInstall {
 
 /// `conan install` command output data
 pub struct ConanOutput(Output);
-
-/// Progress monitor for `conan install` command execution
-///
-/// This type allows monitoring the progress of a running `conan install` command
-/// by providing access to stdout and stderr streams in real-time.
-pub struct ConanProgress {
-    child: Child,
-    stdout: Option<ChildStdout>,
-    stderr: Option<ChildStderr>,
-}
 
 /// Channel-based progress monitor that sends output chunks to caller-provided channels
 pub struct ConanChannelMonitor {
@@ -543,101 +508,6 @@ impl ConanInstall {
         ConanOutput(output)
     }
 
-    /// Runs the `conan install` command and returns a progress monitor.
-    ///
-    /// This method allows monitoring the command execution in real-time by providing
-    /// access to stdout and stderr streams. The command runs asynchronously and
-    /// can be monitored using the returned `ConanProgress` handle.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the Conan executable cannot be found.
-    pub fn run_with_progress(&self) -> ConanProgress {
-        let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
-        let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
-
-        let output_folder = match &self.output_folder {
-            Some(s) => s.clone(),
-            None => std::env::var_os("OUT_DIR")
-                .expect("OUT_DIR environment variable must be set")
-                .into(),
-        };
-
-        if self.new_profile {
-            Self::run_profile_detect(&conan, self.profile.as_deref());
-
-            if self.build_profile != self.profile {
-                Self::run_profile_detect(&conan, self.build_profile.as_deref());
-            };
-        }
-
-        let mut command = Command::new(conan);
-        command
-            .arg("install")
-            .arg(recipe)
-            .arg(format!("-v{}", self.verbosity))
-            .arg("--format")
-            .arg("json")
-            .arg("--output-folder")
-            .arg(output_folder)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if let Some(remote) = self.remote.as_deref() {
-            command.arg("--remote");
-            command.arg(remote);
-        }
-
-        if let Some(profile) = self.profile.as_deref() {
-            command.arg("--profile:host").arg(profile);
-        }
-
-        if let Some(build_profile) = self.build_profile.as_deref() {
-            command.arg("--profile:build").arg(build_profile);
-        }
-
-        if let Some(build) = self.build.as_deref() {
-            command.arg("--build");
-            command.arg(build);
-        }
-
-        if let Some(build_type) = self.build_type.as_deref() {
-            // Prefer the user-provided build setting values.
-            command.arg("--settings");
-            command.arg(format!("build_type={build_type}"));
-        } else {
-            // Otherwise, use additional environment variables set by Cargo.
-            Self::add_settings_from_env(&mut command);
-        }
-
-        for (scope, key, value) in &self.options {
-            command.arg("--options");
-            command.arg(format!("{scope}:{key}={value}"));
-        }
-
-        for (key, value) in &self.confs {
-            command.arg("--conf");
-            command.arg(format!("{key}={value}"));
-        }
-
-        self.extra_args.iter().for_each(|x| {
-            command.arg(x);
-        });
-
-        let mut child = command
-            .spawn()
-            .expect("failed to spawn the Conan executable");
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        ConanProgress {
-            child,
-            stdout,
-            stderr,
-        }
-    }
-
     /// Runs the `conan install` command with channel-based monitoring.
     ///
     /// This method spawns the command in a separate thread and sends real-time
@@ -853,50 +723,6 @@ impl ConanInstall {
                 command.arg("build_type=Release");
             }
             _ => (),
-        }
-    }
-}
-
-impl ConanProgress {
-    /// Creates a buffered reader for the stdout stream.
-    ///
-    /// This allows reading the command's standard output in real-time.
-    pub fn stdout_reader(&mut self) -> BufReader<ChildStdout> {
-        BufReader::new(self.stdout.take().expect("stdout already taken"))
-    }
-
-    /// Creates a buffered reader for the stderr stream.
-    ///
-    /// This allows reading the command's standard error in real-time.
-    pub fn stderr_reader(&mut self) -> BufReader<ChildStderr> {
-        BufReader::new(self.stderr.take().expect("stderr already taken"))
-    }
-
-    /// Checks if the command is still running.
-    pub fn is_running(&mut self) -> bool {
-        self.child.try_wait().map_or(true, |result| result.is_none())
-    }
-
-    /// Waits for the command to complete and returns the final output.
-    ///
-    /// This blocks until the command finishes execution.
-    pub fn wait(self) -> ConanOutput {
-        let output = self.child.wait_with_output().expect("failed to wait for child process");
-        ConanOutput(output)
-    }
-
-    /// Attempts to get the command output without blocking.
-    ///
-    /// Returns `Some(ConanOutput)` if the command has completed,
-    /// or `None` if it's still running.
-    pub fn try_wait(&mut self) -> Option<ConanOutput> {
-        match self.child.try_wait() {
-            Ok(Some(_status)) => {
-                // Command has completed, but we can't get output without consuming the child
-                // For now, just return None to indicate we need to use wait() to get final output
-                None
-            }
-            _ => None, // Still running or error
         }
     }
 }
