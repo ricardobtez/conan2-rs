@@ -123,14 +123,91 @@
 //!
 //! metadata.emit();
 //! ```
+//!
+//! ### Monitoring command progress
+//!
+//! Monitor the progress of a `conan install` command in real-time using channels:
+//!
+//! ```no_run
+//! use conan2::ConanInstall;
+//! use std::sync::mpsc;
+//! use std::thread;
+//!
+//! let (stdout_tx, stdout_rx) = mpsc::channel();
+//! let (stderr_tx, stderr_rx) = mpsc::channel();
+//!
+//! let monitor = ConanInstall::new()
+//!     .run_with_channels(stdout_tx, stderr_tx);
+//!
+//! // Monitor stdout in a separate thread
+//! thread::spawn(move || {
+//!     while let Ok(data) = stdout_rx.recv() {
+//!         println!("Output: {}", String::from_utf8_lossy(&data));
+//!     }
+//! });
+//!
+//! // Wait for completion and get final output
+//! match monitor.wait() {
+//!     Ok(output) => output.parse().emit(),
+//!     Err(e) => eprintln!("Monitoring failed: {}", e),
+//! }
+//! ```
+//!
+//! ### Using callback-based monitoring
+//!
+//! For simpler use cases, use callbacks instead of channels:
+//!
+//! ```no_run
+//! use conan2::ConanInstall;
+//!
+//! let monitor = ConanInstall::new()
+//!     .run_with_callbacks_simple(
+//!         |data| println!("Stdout: {}", String::from_utf8_lossy(&data)),
+//!         |data| eprintln!("Stderr: {}", String::from_utf8_lossy(&data)),
+//!     );
+//!
+//! match monitor.wait() {
+//!     Ok(output) => output.parse().emit(),
+//!     Err(e) => eprintln!("Monitoring failed: {}", e),
+//! }
+//! ```
+//!
+//! ### Using configurable monitoring
+//!
+//! Configure monitoring behavior with custom buffer sizes, channel capacities, and timeouts:
+//!
+//! ```no_run
+//! use conan2::{ConanInstall, MonitorConfig};
+//! use std::time::Duration;
+//!
+//! let config = MonitorConfig::new()
+//!     .buffer_size(4096)
+//!     .channel_capacity(50)
+//!     .default_timeout(Duration::from_secs(30));
+//!
+//! let (stdout_tx, stdout_rx) = mpsc::channel();
+//! let (stderr_tx, stderr_rx) = mpsc::channel();
+//!
+//! let monitor = ConanInstall::new()
+//!     .run_with_config_and_channels(config, stdout_tx, stderr_tx);
+//!
+//! // Use timeout when waiting
+//! match monitor.wait_timeout(Duration::from_secs(10)) {
+//!     Ok(output) => output.parse().emit(),
+//!     Err(e) => eprintln!("Monitoring failed: {}", e),
+//! }
+//! ```
 
 #![deny(missing_docs)]
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{BufRead, Cursor, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -139,6 +216,66 @@ const CONAN_ENV: &str = "CONAN";
 
 /// Default Conan binary name
 const DEFAULT_CONAN: &str = "conan";
+
+/// Default buffer size for reading process output
+const DEFAULT_BUFFER_SIZE: usize = 1024;
+
+/// Default channel capacity for monitoring
+const DEFAULT_CHANNEL_CAPACITY: usize = 100;
+
+/// Error types for monitoring operations
+#[derive(Debug)]
+pub enum MonitorError {
+    /// The monitored process failed with a non-zero exit code
+    ProcessFailed(i32, String),
+    /// The monitoring operation timed out
+    Timeout,
+    /// The channel was closed unexpectedly
+    ChannelClosed,
+    /// An I/O error occurred while reading process output
+    IoError(std::io::Error),
+    /// The monitoring thread panicked
+    JoinError(Box<dyn std::any::Any + Send>),
+    /// Failed to spawn the process
+    SpawnError(std::io::Error),
+}
+
+impl std::fmt::Display for MonitorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MonitorError::ProcessFailed(code, msg) => {
+                write!(f, "Process failed with exit code {}: {}", code, msg)
+            }
+            MonitorError::Timeout => write!(f, "Monitoring operation timed out"),
+            MonitorError::ChannelClosed => write!(f, "Channel was closed unexpectedly"),
+            MonitorError::IoError(e) => write!(f, "I/O error: {}", e),
+            MonitorError::JoinError(_) => write!(f, "Monitoring thread panicked"),
+            MonitorError::SpawnError(e) => write!(f, "Failed to spawn process: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for MonitorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MonitorError::IoError(e) => Some(e),
+            MonitorError::SpawnError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for MonitorError {
+    fn from(e: std::io::Error) -> Self {
+        MonitorError::IoError(e)
+    }
+}
+
+impl From<Box<dyn std::any::Any + Send>> for MonitorError {
+    fn from(e: Box<dyn std::any::Any + Send>) -> Self {
+        MonitorError::JoinError(e)
+    }
+}
 
 /// `conan` command verbosity level
 ///
@@ -218,6 +355,62 @@ pub struct ConanInstall {
 
 /// `conan install` command output data
 pub struct ConanOutput(Output);
+
+/// Channel-based progress monitor that sends output chunks to caller-provided channels
+pub struct ConanChannelMonitor {
+    join_handle: thread::JoinHandle<Result<ConanOutput, MonitorError>>,
+    started_at: Instant,
+}
+
+/// Configuration for monitoring behavior
+#[derive(Debug, Clone)]
+pub struct MonitorConfig {
+    /// Buffer size for reading process output
+    pub buffer_size: usize,
+    /// Channel capacity for stdout and stderr
+    pub channel_capacity: usize,
+    /// Default timeout for wait operations (None = no timeout)
+    pub default_timeout: Option<Duration>,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        MonitorConfig {
+            buffer_size: DEFAULT_BUFFER_SIZE,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            default_timeout: None,
+        }
+    }
+}
+
+impl MonitorConfig {
+    /// Creates a new MonitorConfig with default values
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the buffer size for reading process output
+    #[must_use]
+    pub fn buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
+
+    /// Sets the channel capacity for stdout and stderr
+    #[must_use]
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = capacity;
+        self
+    }
+
+    /// Sets the default timeout for wait operations
+    #[must_use]
+    pub fn default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(timeout);
+        self
+    }
+}
 
 /// Build script instructions for Cargo
 pub struct CargoInstructions {
@@ -391,13 +584,11 @@ impl ConanInstall {
         self
     }
 
-    /// Runs the `conan install` command and captures its JSON-formatted output.
+    /// Builds the `conan install` command with all configured options.
     ///
-    /// # Panics
-    ///
-    /// Panics if the Conan executable cannot be found.
-    #[must_use]
-    pub fn run(&self) -> ConanOutput {
+    /// This is a generic function that both `run()` and `run_with_channels()` use
+    /// to avoid code duplication.
+    fn build_command(&self) -> Command {
         let conan = std::env::var_os(CONAN_ENV).unwrap_or_else(|| DEFAULT_CONAN.into());
         let recipe = self.recipe_path.as_deref().unwrap_or(Path::new("."));
 
@@ -467,11 +658,280 @@ impl ConanInstall {
             command.arg(x);
         });
 
+        command
+    }
+
+    /// Runs the `conan install` command and captures its JSON-formatted output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    #[must_use]
+    pub fn run(&self) -> ConanOutput {
+        let mut command = self.build_command();
+
         let output = command
             .output()
             .expect("failed to run the Conan executable");
 
         ConanOutput(output)
+    }
+
+    /// Runs the `conan install` command with channel-based monitoring.
+    ///
+    /// This method spawns the command in a separate thread and sends real-time
+    /// stdout and stderr chunks to the provided channels. The caller can monitor
+    /// progress by receiving from these channels while the command executes.
+    ///
+    /// # Arguments
+    ///
+    /// * `stdout_tx` - Sender for stdout chunks (bytes)
+    /// * `stderr_tx` - Sender for stderr chunks (bytes)
+    ///
+    /// # Returns
+    ///
+    /// A `ConanChannelMonitor` that can be used to wait for the final output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Conan executable cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::ConanInstall;
+    /// use std::sync::mpsc;
+    /// use std::thread;
+    ///
+    /// let (stdout_tx, stdout_rx) = mpsc::channel();
+    /// let (stderr_tx, stderr_rx) = mpsc::channel();
+    ///
+    /// let monitor = ConanInstall::new()
+    ///     .run_with_channels(stdout_tx, stderr_tx);
+    ///
+    /// // Monitor progress in real-time
+    /// thread::spawn(move || {
+    ///     while let Ok(data) = stdout_rx.recv() {
+    ///         println!("Stdout: {}", String::from_utf8_lossy(&data));
+    ///     }
+    /// });
+    ///
+    /// // Wait for final output
+    /// let output = monitor.wait().expect("Monitoring failed");
+    /// output.parse().emit();
+    /// ```
+    pub fn run_with_channels(
+        &self,
+        stdout_tx: mpsc::Sender<Vec<u8>>,
+        stderr_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ConanChannelMonitor {
+        self.run_with_config_and_channels(MonitorConfig::default(), stdout_tx, stderr_tx)
+    }
+
+    /// Runs the `conan install` command with configurable monitoring and channel-based output.
+    ///
+    /// This method provides more control over the monitoring behavior, allowing configuration
+    /// of buffer sizes, channel capacities, and timeouts.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Monitoring configuration
+    /// * `stdout_tx` - Sender for stdout chunks (bytes)
+    /// * `stderr_tx` - Sender for stderr chunks (bytes)
+    ///
+    /// # Returns
+    ///
+    /// A `ConanChannelMonitor` that can be used to wait for the final output.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::{ConanInstall, MonitorConfig};
+    /// use std::sync::mpsc;
+    /// use std::time::Duration;
+    ///
+    /// let config = MonitorConfig::new()
+    ///     .buffer_size(4096)
+    ///     .channel_capacity(50)
+    ///     .default_timeout(Duration::from_secs(30));
+    ///
+    /// let (stdout_tx, stdout_rx) = mpsc::channel();
+    /// let (stderr_tx, stderr_rx) = mpsc::channel();
+    ///
+    /// let monitor = ConanInstall::new()
+    ///     .run_with_config_and_channels(config, stdout_tx, stderr_tx);
+    ///
+    /// // Monitor and process output...
+    /// let output = monitor.wait();
+    /// ```
+    pub fn run_with_config_and_channels(
+        &self,
+        config: MonitorConfig,
+        stdout_tx: mpsc::Sender<Vec<u8>>,
+        stderr_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ConanChannelMonitor {
+        let mut command = self.build_command();
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let join_handle = thread::spawn(move || {
+            let mut child = command
+                .spawn()
+                .map_err(MonitorError::SpawnError)?;
+
+            let mut stdout = child.stdout.take().expect("failed to take stdout");
+            let mut stderr = child.stderr.take().expect("failed to take stderr");
+
+            let buffer_size = config.buffer_size;
+
+            // Read and forward stdout
+            let stdout_tx_clone = stdout_tx.clone();
+            let stdout_handle = thread::spawn(move || {
+                let mut buffer = vec![0; buffer_size];
+                loop {
+                    match stdout.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let data = buffer[..n].to_vec();
+                            if stdout_tx_clone.send(data).is_err() {
+                                // Receiver dropped, stop sending
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading stdout: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Read and forward stderr
+            let stderr_handle = thread::spawn(move || {
+                let mut buffer = vec![0; buffer_size];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let data = buffer[..n].to_vec();
+                            if stderr_tx.send(data).is_err() {
+                                // Receiver dropped, stop sending
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading stderr: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Wait for child to complete
+            let output = child
+                .wait_with_output()
+                .map_err(MonitorError::IoError)?;
+
+            // Wait for forwarding threads to finish
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+
+            if output.status.success() {
+                Ok(ConanOutput(output))
+            } else {
+                let stderr_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                Err(MonitorError::ProcessFailed(
+                    output.status.code().unwrap_or(-1),
+                    stderr_msg,
+                ))
+            }
+        });
+
+        ConanChannelMonitor {
+            join_handle,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Runs the `conan install` command with callback-based monitoring.
+    ///
+    /// This method provides a simpler API for monitoring by using callbacks
+    /// instead of channels. The callbacks are invoked in separate threads
+    /// as data becomes available.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Monitoring configuration
+    /// * `on_stdout` - Callback for stdout chunks (bytes)
+    /// * `on_stderr` - Callback for stderr chunks (bytes)
+    ///
+    /// # Returns
+    ///
+    /// A `ConanChannelMonitor` that can be used to wait for the final output.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use conan2::{ConanInstall, MonitorConfig};
+    ///
+    /// let config = MonitorConfig::new();
+    ///
+    /// let monitor = ConanInstall::new()
+    ///     .run_with_callbacks(
+    ///         config,
+    ///         |data| println!("Stdout: {}", String::from_utf8_lossy(&data)),
+    ///         |data| eprintln!("Stderr: {}", String::from_utf8_lossy(&data)),
+    ///     );
+    ///
+    /// let output = monitor.wait();
+    /// output.parse().emit();
+    /// ```
+    pub fn run_with_callbacks<F, G>(
+        &self,
+        config: MonitorConfig,
+        on_stdout: F,
+        on_stderr: G,
+    ) -> ConanChannelMonitor
+    where
+        F: Fn(Vec<u8>) + Send + 'static,
+        G: Fn(Vec<u8>) + Send + 'static,
+    {
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+
+        // Spawn threads to process callbacks
+        thread::spawn(move || {
+            while let Ok(data) = stdout_rx.recv() {
+                on_stdout(data);
+            }
+        });
+
+        thread::spawn(move || {
+            while let Ok(data) = stderr_rx.recv() {
+                on_stderr(data);
+            }
+        });
+
+        self.run_with_config_and_channels(config, stdout_tx, stderr_tx)
+    }
+
+    /// Runs the `conan install` command with simple callback-based monitoring using default config.
+    ///
+    /// This is a convenience method that uses default monitoring configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `on_stdout` - Callback for stdout chunks (bytes)
+    /// * `on_stderr` - Callback for stderr chunks (bytes)
+    ///
+    /// # Returns
+    ///
+    /// A `ConanChannelMonitor` that can be used to wait for the final output.
+    pub fn run_with_callbacks_simple<F, G>(&self, on_stdout: F, on_stderr: G) -> ConanChannelMonitor
+    where
+        F: Fn(Vec<u8>) + Send + 'static,
+        G: Fn(Vec<u8>) + Send + 'static,
+    {
+        self.run_with_callbacks(MonitorConfig::default(), on_stdout, on_stderr)
     }
 
     /// Creates a new profile with `conan profile detect` if required.
@@ -515,6 +975,60 @@ impl ConanInstall {
             }
             _ => (),
         }
+    }
+}
+
+impl ConanChannelMonitor {
+    /// Waits for the command to complete and returns the final output.
+    ///
+    /// This blocks until the command finishes execution and all output
+    /// has been sent through the channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `MonitorError` if the monitoring operation failed.
+    pub fn wait(self) -> Result<ConanOutput, MonitorError> {
+        self.join_handle
+            .join()
+            .map_err(|e| MonitorError::JoinError(Box::new(e)))?
+    }
+
+    /// Waits for the command to complete with a timeout.
+    ///
+    /// This blocks until the command finishes execution or the timeout is reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for completion
+    ///
+    /// # Errors
+    ///
+    /// Returns a `MonitorError::Timeout` if the timeout is reached before completion.
+    /// Returns other `MonitorError` variants if the monitoring operation failed.
+    pub fn wait_timeout(self, timeout: Duration) -> Result<ConanOutput, MonitorError> {
+        // Use a channel to receive the result from the join thread
+        let (tx, rx) = mpsc::channel();
+
+        let join_handle = self.join_handle;
+        thread::spawn(move || {
+            let result = join_handle.join();
+            tx.send(result).ok();
+        });
+
+        // Wait for the result or timeout
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(Ok(output))) => Ok(output),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(e)) => Err(MonitorError::JoinError(e)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(MonitorError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(MonitorError::ChannelClosed),
+        }
+    }
+
+    /// Returns the elapsed time since the monitor was started.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
     }
 }
 
