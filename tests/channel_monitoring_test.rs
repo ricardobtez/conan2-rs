@@ -1,4 +1,4 @@
-use conan2::ConanInstall;
+use conan2::{ConanInstall, MonitorConfig, MonitorError};
 use std::env;
 use std::sync::mpsc;
 use std::thread;
@@ -21,21 +21,65 @@ fn test_channel_monitoring_api() {
     // Verify that we can receive from the channels
     // (We won't actually run conan to avoid requiring a real setup)
     // Just verify the API works
-    monitor.wait();
+    let result = monitor.wait();
 
-    // The monitor should be able to wait (though it will hang without actual conan)
-    // For this test, we just verify compilation and basic functionality
+    // The result should be an error since we don't have a real conan setup
+    // but the API should work correctly
+    let _ = result;
 
     // Drop receivers to allow monitor to complete gracefully
     drop(stdout_rx);
     drop(stderr_rx);
 
-    // Note: In a real scenario, you would:
-    // 1. Spawn a thread to read from stdout_rx and stderr_rx
-    // 2. Process the real-time output
-    // 3. Call monitor.wait() to get the final ConanOutput
-
     // This test just verifies the API compiles and the types work correctly
+}
+
+#[test]
+fn test_monitor_config() {
+    // Test that MonitorConfig can be created and configured
+    let config = MonitorConfig::new()
+        .buffer_size(4096)
+        .channel_capacity(50)
+        .default_timeout(Duration::from_secs(30));
+
+    assert_eq!(config.buffer_size, 4096);
+    assert_eq!(config.channel_capacity, 50);
+    assert_eq!(config.default_timeout, Some(Duration::from_secs(30)));
+}
+
+#[test]
+fn test_monitor_config_defaults() {
+    // Test default values
+    let config = MonitorConfig::default();
+
+    assert_eq!(config.buffer_size, 1024); // DEFAULT_BUFFER_SIZE
+    assert_eq!(config.channel_capacity, 100); // DEFAULT_CHANNEL_CAPACITY
+    assert_eq!(config.default_timeout, None);
+}
+
+#[test]
+fn test_monitor_error_display() {
+    // Test that MonitorError implements Display
+    let error = MonitorError::Timeout;
+    assert_eq!(format!("{}", error), "Monitoring operation timed out");
+
+    let error = MonitorError::ProcessFailed(1, "test error".to_string());
+    assert_eq!(format!("{}", error), "Process failed with exit code 1: test error");
+
+    let error = MonitorError::ChannelClosed;
+    assert_eq!(format!("{}", error), "Channel was closed unexpectedly");
+}
+
+#[test]
+fn test_monitor_error_from_io_error() {
+    // Test that MonitorError can be created from io::Error
+    let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+    let monitor_error: MonitorError = io_error.into();
+    
+    match monitor_error {
+        MonitorError::IoError(_) => assert!(true),
+        _ => assert!(false, "Expected IoError variant"),
+    }
 }
 
 #[test]
@@ -76,7 +120,7 @@ fn test_channel_monitoring_real_conan_install() {
 
     // Start the monitoring and wait for completion
     let monitor = install.run_with_channels(stdout_tx, stderr_tx);
-    let final_output = monitor.wait();
+    let final_output = monitor.wait().expect("Monitoring should succeed");
 
     // Clean up monitoring threads
     drop(stdout_handle);
@@ -134,12 +178,101 @@ fn test_channel_monitoring_with_timeout() {
 
     // Give threads a chance to start
     thread::sleep(Duration::from_millis(50));
-    monitor.wait();
+    
+    // Test timeout functionality - this should timeout since we don't have a real conan setup
+    let result = monitor.wait_timeout(Duration::from_millis(100));
+    
+    // We expect either a timeout or an error since we don't have a real conan setup
+    match result {
+        Ok(_) => {}, // Unexpected but acceptable
+        Err(MonitorError::Timeout) => {}, // Expected
+        Err(_) => {}, // Other errors are also acceptable in this test context
+    }
 
     // Clean up
     drop(stdout_handle);
     drop(stderr_handle);
 
     // The test passes if we get here without panicking
-    // (actual conan execution would require proper setup)
+}
+
+#[test]
+fn test_callback_based_monitoring() {
+    // Test the callback-based API
+    env::set_var("OUT_DIR", "/tmp/conan2_test_output");
+
+    use std::sync::{Arc, Mutex};
+
+    let install = ConanInstall::new();
+    
+    let stdout_data = Arc::new(Mutex::new(Vec::new()));
+    let stderr_data = Arc::new(Mutex::new(Vec::new()));
+    
+    let stdout_data_clone = stdout_data.clone();
+    let stderr_data_clone = stderr_data.clone();
+
+    let monitor = install.run_with_callbacks_simple(
+        move |data| {
+            let mut stdout = stdout_data_clone.lock().unwrap();
+            stdout.extend_from_slice(&data);
+        },
+        move |data| {
+            let mut stderr = stderr_data_clone.lock().unwrap();
+            stderr.extend_from_slice(&data);
+        },
+    );
+
+    // This will likely fail since we don't have a real conan setup, but the API should work
+    let _result = monitor.wait();
+    
+    // We can't assert much about the result since we don't have a real conan setup,
+    // but we can verify that the API compiles and works
+}
+
+#[test]
+fn test_config_and_channels() {
+    // Test the configurable monitoring API
+    env::set_var("OUT_DIR", "/tmp/conan2_test_output");
+
+    let install = ConanInstall::new();
+    
+    let config = MonitorConfig::new()
+        .buffer_size(2048)
+        .channel_capacity(25);
+
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+
+    let monitor = install.run_with_config_and_channels(config, stdout_tx, stderr_tx);
+    
+    // This will likely fail since we don't have a real conan setup, but the API should work
+    let _result = monitor.wait();
+    
+    drop(stdout_rx);
+    drop(stderr_rx);
+}
+
+#[test]
+fn test_monitor_elapsed() {
+    // Test the elapsed time functionality
+    env::set_var("OUT_DIR", "/tmp/conan2_test_output");
+
+    let install = ConanInstall::new();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+
+    let monitor = install.run_with_channels(stdout_tx, stderr_tx);
+    
+    // Check that elapsed time is reasonable
+    let elapsed_before = monitor.elapsed();
+    assert!(elapsed_before < Duration::from_secs(1));
+
+    // Wait a bit
+    thread::sleep(Duration::from_millis(10));
+    
+    let elapsed_after = monitor.elapsed();
+    assert!(elapsed_after >= elapsed_before);
+
+    drop(stdout_rx);
+    drop(stderr_rx);
 }
